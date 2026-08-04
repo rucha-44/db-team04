@@ -3,103 +3,111 @@
 (function () {
   'use strict';
 
-  const FEED_EL   = document.getElementById('trade-feed');
-  const STATUS_EL = document.getElementById('sse-status');
-  if (!FEED_EL) return; // guard: script may load on pages without the feed
-
-  const STREAM_URL = '/api/v1/trades/stream';
-  let sse = null;
-
-  // ── Helpers ────────────────────────────────────────────────────────────────
-  function updateBadge(text) {
-    if (STATUS_EL) STATUS_EL.textContent = text;
-  }
-
-  /** Always escape server-provided strings before inserting into innerHTML. */
-  function escapeHtml(s) {
-    return String(s)
-      .replace(/&/g,  '&amp;')
-      .replace(/</g,  '&lt;')
-      .replace(/>/g,  '&gt;')
-      .replace(/"/g,  '&quot;')
-      .replace(/'/g,  '&#39;');
-  }
-
   const fmtQty   = new Intl.NumberFormat('en-US');
   const fmtPrice = new Intl.NumberFormat('en-US', {
     minimumFractionDigits: 2,
     maximumFractionDigits: 4,
   });
 
-  // ── TICKET-ADV105 — prepend one trade card ─────────────────────────────────
-  function prependTradeRow(trade) {
-    const statusMap = { MATCHED: 'matched', BREAK: 'break', UNMATCHED: 'break' };
-    const mod = statusMap[trade.status] || 'pending';
+  /** Always escape server-provided strings before inserting into innerHTML. */
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
 
-    const el = document.createElement('article');
-    // trade-card--new triggers the combined slide-in + fade-in entrance;
-    // strip it after 500 ms once the CSS animation finishes.
-    el.className = 'trade-card trade-card--' + mod + ' trade-card--new';
-    el.innerHTML =
-      '<strong>' + escapeHtml(trade.tradeRef) + '</strong> ' +
-      '<span>' + escapeHtml(trade.symbol) + '</span> ' +
-      '<span>qty=' + fmtQty.format(trade.qty != null ? trade.qty : (trade.quantity || 0)) + '</span> ' +
-      '<span>price=' + fmtPrice.format(trade.price || 0) + '</span> ' +
-      '<span>[' + escapeHtml(trade.status) + ']</span>';
+  // ES6 class wrapping the SSE connection + feed-rendering state.
+  class TradeFeed {
+    constructor(feedEl, statusEl, streamUrl, maxEntries) {
+      this.feedEl = feedEl;
+      this.statusEl = statusEl;
+      this.streamUrl = streamUrl || '/api/v1/trades/stream';
+      this.maxEntries = maxEntries || 50;
+      this.sse = null;
+    }
 
-    FEED_EL.prepend(el);
+    updateBadge(text) {
+      if (this.statusEl) this.statusEl.textContent = text;
+    }
 
-    // Remove the --new modifier once the 0.4 s CSS animation completes.
-    setTimeout(function () { el.classList.remove('trade-card--new'); }, 500);
+    // TICKET-ADV105 — prepend one trade card
+    prependTradeRow(trade) {
+      const statusMap = { MATCHED: 'matched', BREAK: 'break', UNMATCHED: 'break' };
+      const mod = statusMap[trade.status] || 'pending';
 
-    // Cap the feed at 50 entries so the DOM stays bounded after a long session.
-    while (FEED_EL.children.length > 50) {
-      FEED_EL.lastElementChild.remove();
+      const el = document.createElement('article');
+      // trade-card--new triggers the combined slide-in + fade-in entrance;
+      // stripped after 500 ms once the CSS animation finishes.
+      el.className = 'trade-card trade-card--' + mod + ' trade-card--new';
+      el.innerHTML =
+        '<strong>' + escapeHtml(trade.tradeRef) + '</strong> ' +
+        '<span>' + escapeHtml(trade.symbol) + '</span> ' +
+        '<span>qty=' + fmtQty.format(trade.qty != null ? trade.qty : (trade.quantity || 0)) + '</span> ' +
+        '<span>price=' + fmtPrice.format(trade.price || 0) + '</span> ' +
+        '<span>[' + escapeHtml(trade.status) + ']</span>';
+
+      this.feedEl.prepend(el);
+
+      setTimeout(() => el.classList.remove('trade-card--new'), 500);
+
+      // Cap the feed so the DOM stays bounded after a long session.
+      while (this.feedEl.children.length > this.maxEntries) {
+        this.feedEl.lastElementChild.remove();
+      }
+    }
+
+    // TICKET-ADV104 — EventSource connection
+    connect() {
+      this.sse = new EventSource(this.streamUrl);
+
+      this.sse.onopen = () => this.updateBadge('Live');
+
+      this.sse.onmessage = (e) => {
+        try {
+          this.prependTradeRow(JSON.parse(e.data));
+        } catch (_) {
+          // malformed JSON from server — ignore silently
+        }
+      };
+
+      // IMPORTANT: do NOT reconnect manually inside onerror.
+      // EventSource auto-reconnects on its own with exponential backoff;
+      // calling connect() again here would flood the dev server with
+      // cascading connection attempts.
+      this.sse.onerror = () => this.updateBadge('Reconnecting…');
+    }
+
+    close() {
+      if (this.sse) this.sse.close();
+    }
+
+    // Demo fallback — fires a few hardcoded trades via setTimeout so the
+    // page still demonstrates the animated feed without a live backend.
+    // Remove this call once your backend SSE endpoint is live.
+    runDemo(demoTrades) {
+      demoTrades.forEach((trade, i) => {
+        setTimeout(() => this.prependTradeRow(trade), 500 * (i + 1));
+      });
     }
   }
 
-  // ── TICKET-ADV104 — EventSource connection ─────────────────────────────────
-  function connect() {
-    sse = new EventSource(STREAM_URL);
+  const FEED_EL = document.getElementById('trade-feed');
+  if (!FEED_EL) return; // guard: script may load on pages without the feed
+  const STATUS_EL = document.getElementById('sse-status');
 
-    sse.onopen = function () {
-      updateBadge('Live');
-    };
-
-    sse.onmessage = function (e) {
-      try {
-        prependTradeRow(JSON.parse(e.data));
-      } catch (_) {
-        // malformed JSON from server — ignore silently
-      }
-    };
-
-    // IMPORTANT: do NOT call connect() again inside onerror.
-    // EventSource auto-reconnects with exponential backoff. Calling connect()
-    // here would flood the dev server with cascading connection attempts.
-    sse.onerror = function () {
-      updateBadge('Reconnecting…');
-    };
-  }
+  const feed = new TradeFeed(FEED_EL, STATUS_EL);
 
   // Clean up when the user navigates away.
-  window.addEventListener('beforeunload', function () {
-    if (sse) sse.close();
-  });
+  window.addEventListener('beforeunload', () => feed.close());
 
-  // ── Demo fallback ──────────────────────────────────────────────────────────
-  // When no backend is running, EventSource fails silently (badge stays
-  // "Connecting…"). These three hardcoded trades fire via setTimeout so the
-  // page still demonstrates the animated feed without a live backend.
-  // Remove (or comment out) this block once your backend SSE endpoint is live.
-  var DEMO = [
+  feed.runDemo([
     { tradeRef: 'EQU-20260603-0001', symbol: 'SAP.DE',  qty: 1000,    price: 125.50, status: 'MATCHED' },
     { tradeRef: 'FX-20260603-0001',  symbol: 'EUR/USD', qty: 1000000, price: 1.0852, status: 'PENDING' },
     { tradeRef: 'EQU-20260603-0002', symbol: 'AAPL',    qty: 500,     price: 178.20, status: 'BREAK'   },
-  ];
-  DEMO.forEach(function (trade, i) {
-    setTimeout(function () { prependTradeRow(trade); }, 500 * (i + 1));
-  });
+  ]);
 
-  connect();
+  feed.connect();
 })();
